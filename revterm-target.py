@@ -202,7 +202,6 @@ class TlsWebSocket(WebSocket):
             time.sleep(0.1)
             try:
                 buf = self._socket.recv(4096)
-                break
             except ssl.SSLError as e:
                 if e.errno == ssl.SSL_ERROR_WANT_READ:
                     continue
@@ -239,7 +238,7 @@ class TlsWebSocket(WebSocket):
             raise e
 
         # The remaining recv()s should not fail since the websocket frame header should have been received in full.
-        # Only the retrieving the payload may reasonably block (or raise SSL_ERROR_WANT_READ), which is handled by a loop below.
+        # Only retrieving the payload may reasonably block (or raise SSL_ERROR_WANT_READ), which is handled by the loop below.
 
         b1, b2 = struct.unpack('BB', buf)
         finbit = b1 & 0x80 == 0x80

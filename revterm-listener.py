@@ -14,7 +14,7 @@
 #      (via a second socket or a specially-marked packet?  oob is not an option as it's only a single byte)
 #      Crude workaround is to export the size via the COLUMNS LINES environment variables.
 
-import argparse, base64, datetime, fcntl, functools, hashlib, os, select, signal, ssl, socket, struct, sys, termios, time, tty
+import argparse, base64, datetime, functools, hashlib, os, select, ssl, socket, struct, termios, time, tty
 
 class Tty:
     def __init__(self, path):
@@ -82,7 +82,7 @@ class TlsSocket(Socket):
 
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         # openssl req -x509 -nodes -newkey rsa:4096 -keyout server.key -out server.crt -subj '/CN=localhost'
-        # Note that public (but not private) ips can (and should) be used in the certificate common name.
+        # Note that public (but not private) ips can (and should) be used as the certificate common name.
         context.load_cert_chain('server.crt', 'server.key')
 
         rv._origclient = rv._client
@@ -220,7 +220,6 @@ class TlsWebSocket(WebSocket):
             time.sleep(0.1)
             try:
                 buf = self._client.recv(4096)
-                break
             except ssl.SSLError as e:
                 if e.errno == ssl.SSL_ERROR_WANT_READ:
                     continue
@@ -263,7 +262,7 @@ class TlsWebSocket(WebSocket):
             raise e
 
         # The remaining recv()s should not fail since the websocket frame header should have been received in full.
-        # Only the retrieving the payload may reasonably block (or raise SSL_ERROR_WANT_READ), which is handled by a loop below.
+        # Only retrieving the payload may reasonably block (or raise SSL_ERROR_WANT_READ), which is handled by the loop below.
 
         assert len(buf) == 2
         b1, b2 = struct.unpack('BB', buf)
@@ -315,8 +314,8 @@ if __name__ == '__main__':
                                  [v for k,v in args.__dict__.items() if 'socket' in k]) \
                     or 'Socket'
 
-    # /dev/tty is a synonym for the controlling terminal, ref "man 4 tty"
-    # (and so is the equivalaent to os.ttyname(sys.stdout.filename()))
+    # /dev/tty is a synonym for the controlling terminal, ref man 4 tty
+    # (and so is the equivalent to os.ttyname(sys.stdout.fileno()))
     ttypath = args.tty or '/dev/tty'
     with Tty(ttypath) as tty:
         with locals()[transport](args.port) as target:
