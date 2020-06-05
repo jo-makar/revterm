@@ -155,7 +155,10 @@ class WebSocket:
         return self._client.fileno()
 
     def read(self):
-        b1, b2 = struct.unpack('BB', self._client.recv(2))
+        buf = self._client.recv(2)
+        assert len(buf) == 2
+
+        b1, b2 = struct.unpack('BB', buf)
         finbit = b1 & 0x80 == 0x80
         assert finbit
         opcode = b1 & 0x0f
@@ -333,7 +336,8 @@ if __name__ == '__main__':
                     # TODO This is clumsy, investigate alternate approaches
                     exctype, excvalue, trcback = sys.exc_info()
                     _, _, func, text = traceback.extract_tb(trcback)[-1]
-                    if func == 'read' and text == 'assert len(rv) > 0':
+                    if (func == 'read' and text == 'assert len(rv) > 0') or \
+                       (func == 'read' and text == 'assert len(buf) == 2'):
                         print_exc = False
 
                     run = False
