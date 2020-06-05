@@ -92,7 +92,9 @@ class WebSocket:
         self.port = port
 
     def __enter__(self):
-        self._socket_setup()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ip = socket.gethostbyname(self.host)
+        self._socket.connect((ip, self.port))
 
         key = base64.b64encode(os.urandom(16)).decode('utf-8')
 
@@ -121,11 +123,6 @@ class WebSocket:
         assert received == expected
 
         return self
-
-    def _socket_setup(self):
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        ip = socket.gethostbyname(self.host)
-        self._socket.connect((ip, self.port))
 
     def __exit__(self, exctype, excval, traceback):
         self._socket.close()
@@ -174,14 +171,60 @@ class WebSocket:
         self._socket.sendall(frame)
 
 class TlsWebSocket(WebSocket):
-    def _socket_setup(self):
-        super()._socket_setup()
+    def __enter__(self):
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ip = socket.gethostbyname(self.host)
+        self._socket.connect((ip, self.port))
 
         context = ssl.create_default_context()
         context.load_verify_locations('server.crt') # For self-signed certs
 
         self._origsocket = self._socket
         self._socket = context.wrap_socket(self._socket, server_hostname=self.host)
+
+        self._socket.setblocking(False)
+
+        key = base64.b64encode(os.urandom(16)).decode('utf-8')
+
+        self._socket.sendall(( 'GET / HTTP/1.1\r\n' +
+                              f'Host: {self.host}\r\n' +
+                               'Upgrade: websocket\r\n' +
+                               'Connection: Upgrade\r\n' +
+                              f'Sec-WebSocket-Key: {key}\r\n' +
+                               'Sec-WebSocket-Protocol: chat\r\n' +
+                               'Sec-WebSocket-Version: 13\r\n' +
+                              f'Origin: https://{self.host}\r\n' +
+                               '\r\n'
+                             ).encode('utf-8'))
+
+        buf = None
+        while not buf:
+            time.sleep(0.1)
+            try:
+                buf = self._socket.recv(4096)
+                break
+            except ssl.SSLError as e:
+                if e.errno == ssl.SSL_ERROR_WANT_READ:
+                    continue
+                raise e
+
+        while self._socket.pending() > 0:
+            buf += self._socket.recv(self._socket.pending())
+
+        headers = buf.decode('utf-8').splitlines()
+
+        assert headers[0] == 'HTTP/1.1 101 Web Socket Protocol Handshake'
+
+        hs = [h for h in headers if h.startswith('Sec-WebSocket-Accept')]
+        assert len(hs) == 1
+        received = hs[0].split()[1]
+
+        h = hashlib.sha1()
+        h.update(key.encode('utf-8') + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+        expected = base64.b64encode(h.digest()).decode('utf-8')
+        assert received == expected
+
+        return self
 
     def __exit__(self):
         self._socket.close()
@@ -192,7 +235,6 @@ class TlsWebSocket(WebSocket):
             buf = self._socket.recv(2)
         except ssl.SSLError as e:
             if e.errno == ssl.SSL_ERROR_WANT_READ:
-                assert len(buf) == 0
                 return None
             raise e
 
