@@ -14,7 +14,7 @@
 #      (via a second socket or a specially-marked packet?  oob is not an option as it's only a single byte)
 #      Crude workaround is to export the size via the COLUMNS LINES environment variables.
 
-import argparse, base64, datetime, functools, hashlib, os, select, ssl, socket, struct, termios, time, tty
+import argparse, base64, datetime, functools, hashlib, os, select, ssl, socket, struct, sys, termios, time, traceback, tty
 
 class Tty:
     def __init__(self, path):
@@ -148,7 +148,7 @@ class WebSocket:
 
         return self
 
-    def __exit__(self, exctype, excval, traceback):
+    def __exit__(self, exctype, excval, tback):
         self._client.close()
 
     def fileno(self):
@@ -317,16 +317,37 @@ if __name__ == '__main__':
     # /dev/tty is a synonym for the controlling terminal, ref man 4 tty
     # (and so is the equivalent to os.ttyname(sys.stdout.fileno()))
     ttypath = args.tty or '/dev/tty'
-    with Tty(ttypath) as tty:
-        with locals()[transport](args.port) as target:
+    with Tty(ttypath) as tty, \
+         locals()[transport](args.port) as target:
             
-            while True:
-                rlist, _, xlist = select.select([tty, target], [], [tty, target], 1.0)
-                if xlist != []:
+        run, print_exc = True, True
+        while run:
+            rlist, _, _ = select.select([tty, target], [], [], 1.0)
+
+            for r in rlist:
+                try:
+                    d = r.read()
+
+                except AssertionError as e:
+                    # Empty reads occur during a normal socket close
+                    # TODO This is clumsy, investigate alternate approaches
+                    exctype, excvalue, trcback = sys.exc_info()
+                    _, _, func, text = traceback.extract_tb(trcback)[-1]
+                    if func == 'read' and text == 'assert len(rv) > 0':
+                        print_exc = False
+
+                    run = False
                     break
 
-                for r in rlist:
-                    d = r.read()
-                    if d:
-                        w = target if r == tty else tty
-                        w.write(d)
+                except Exception as e:
+                    exctype, excvalue, trcback = sys.exc_info()
+                    run = False
+                    break
+
+                if d:
+                    w = target if r == tty else tty
+                    w.write(d)
+
+    # Wait until the termios settings have been restored before printing this
+    if print_exc:
+        traceback.print_exception(exctype, excvalue, trcback)

