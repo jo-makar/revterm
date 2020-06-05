@@ -96,7 +96,7 @@ class TlsSocket(Socket):
 
         return rv
 
-    def __exit__(self):
+    def __exit__(self, exctype, excval, traceback):
         self._client.close()
         self._origclient.close()
 
@@ -148,7 +148,7 @@ class WebSocket:
 
         return self
 
-    def __exit__(self, exctype, excval, tback):
+    def __exit__(self, exctype, excval, traceback):
         self._client.close()
 
     def fileno(self):
@@ -249,7 +249,7 @@ class TlsWebSocket(WebSocket):
 
         return self
 
-    def __exit__(self):
+    def __exit__(self, exctype, excval, traceback):
         self._client.close()
         self._origclient.close()
 

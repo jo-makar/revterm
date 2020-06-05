@@ -74,7 +74,7 @@ class TlsSocket(Socket):
 
         return rv
 
-    def __exit__(self):
+    def __exit__(self, exctype, excval, traceback):
         self._socket.close()
         self._origsocket.close()
 
@@ -231,7 +231,7 @@ class TlsWebSocket(WebSocket):
 
         return self
 
-    def __exit__(self):
+    def __exit__(self, exctype, excval, traceback):
         self._socket.close()
         self._origsocket.close()
 
