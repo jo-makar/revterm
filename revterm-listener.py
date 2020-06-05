@@ -14,7 +14,7 @@
 #      (via a second socket or a specially-marked packet?  oob is not an option as it's only a single byte)
 #      Crude workaround is to export the size via the COLUMNS LINES environment variables.
 
-import argparse, base64, datetime, fcntl, functools, hashlib, os, select, signal, ssl, socket, struct, sys, termios, tty
+import argparse, base64, datetime, fcntl, functools, hashlib, os, select, signal, ssl, socket, struct, sys, termios, time, tty
 
 class Tty:
     def __init__(self, path):
@@ -82,15 +82,17 @@ class TlsSocket(Socket):
 
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         # openssl req -x509 -nodes -newkey rsa:4096 -keyout server.key -out server.crt -subj '/CN=localhost'
-        # Note that public (not private) ips can (and should) be used in the certificate common name.
+        # Note that public (but not private) ips can (and should) be used in the certificate common name.
         context.load_cert_chain('server.crt', 'server.key')
 
         rv._origclient = rv._client
         rv._client = context.wrap_socket(rv._client, server_side=True)
 
-        # Write a character to kick off the tls handshake or initial exchange?
-        # TODO Investigate why this is necessary and alternate workarounds
-        rv.write(b'a')
+        # Using tls sockets with select() isn't straightforward because select() works with raw sockets.
+        # Ie data may be available on the socket but that doesn't mean data will be available at the tls level.
+        # A simple workaround is to use non-blocking sockets and gracefully handle SSL_ERROR_WANT_READ (tls equiv of EWOULDBLOCK).
+
+        rv._client.setblocking(False)
 
         return rv
 
@@ -98,20 +100,28 @@ class TlsSocket(Socket):
         self._client.close()
         self._origclient.close()
 
+    def read(self, n=1024):
+        try:
+            rv = self._client.recv(n)
+        except ssl.SSLError as e:
+            if e.errno == ssl.SSL_ERROR_WANT_READ:
+                return None
+            raise e
+
+        if self._client.pending() > 0:
+            rv += self._client.recv(self._client.pending())
+
+        assert len(rv) > 0
+        return rv
+
 class WebSocket:
     def __init__(self, port):
         self.port = port
 
     def __enter__(self):
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(('', self.port))
-        server.listen(0)
+        self._socket_setup()
 
-        self.__client, _ = server.accept()
-        server.close()
-
-        headers = self.__client.recv(4096).decode('utf-8').splitlines()
+        headers = self._client.recv(4096).decode('utf-8').splitlines()
         assert len([h for h in headers if h == 'Upgrade: websocket']) > 0
 
         hs = [h for h in headers if h.startswith('Sec-WebSocket-Key')]
@@ -122,7 +132,7 @@ class WebSocket:
         h.update(key.encode('utf-8') + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
         accept = base64.b64encode(h.digest()).decode('utf-8')
         
-        self.__client.sendall(( 'HTTP/1.1 101 Web Socket Protocol Handshake\r\n' +
+        self._client.sendall(( 'HTTP/1.1 101 Web Socket Protocol Handshake\r\n' +
                                 'Upgrade: websocket\r\n' +
                                 'Connection: Upgrade\r\n' +
                                f'Date: {datetime.datetime.now(datetime.timezone.utc).strftime("%c %Z")}\r\n' +
@@ -132,15 +142,23 @@ class WebSocket:
 
         return self
 
+    def _socket_setup(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(('', self.port))
+        server.listen(0)
+
+        self._client, _ = server.accept()
+        server.close()
+
     def __exit__(self, exctype, excval, traceback):
-        self.__client.close()
+        self._client.close()
 
     def fileno(self):
-        return self.__client.fileno()
+        return self._client.fileno()
 
     def read(self):
-        buf = self.__client.recv(2)
-        b1, b2 = struct.unpack('BB', buf)
+        b1, b2 = struct.unpack('BB', self._client.recv(2))
         finbit = b1 & 0x80 == 0x80
         assert finbit
         opcode = b1 & 0x0f
@@ -152,13 +170,13 @@ class WebSocket:
         if payloadlen < 126:
             pass
         elif payloadlen == 126:
-            payloadlen = struct.unpack('>H', self.__client.recv(2))[0]
+            payloadlen = struct.unpack('>H', self._client.recv(2))[0]
         else: # payloadlen == 127:
-            payloadlen = struct.unpack('>Q', self.__client.recv(2))[0]
+            payloadlen = struct.unpack('>Q', self._client.recv(2))[0]
 
-        key = self.__client.recv(4)
+        key = self._client.recv(4)
 
-        masked_payload = self.__client.recv(payloadlen, socket.MSG_WAITALL)
+        masked_payload = self._client.recv(payloadlen, socket.MSG_WAITALL)
         assert len(masked_payload) == payloadlen
 
         payload = b''
@@ -180,9 +198,66 @@ class WebSocket:
             assert len(data) < 2**63
             frame += b'\x7f' + struct.pack('>Q', len(data))
 
-        self.__client.sendall(frame + data)
+        self._client.sendall(frame + data)
 
-# FIXME Implement TlsWebSocket
+class TlsWebSocket(WebSocket):
+    def _socket_setup(self):
+        super()._socket_setup()
+
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain('server.crt', 'server.key')
+
+        self._origclient = self._client
+        self._client = context.wrap_socket(self._client, server_side=True)
+
+        self._client.setblocking(False)
+
+    def __exit__(self):
+        self._client.close()
+        self._origclient.close()
+
+    def read(self):
+        try:
+            buf = self._client.recv(2)
+        except ssl.SSLError as e:
+            if e.errno == ssl.SSL_ERROR_WANT_READ:
+                assert len(buf) == 0
+                return None
+            raise e
+
+        # The remaining recv()s should not fail since the websocket frame header should have been received in full.
+        # Only the retrieving the payload may reasonably block (or raise SSL_ERROR_WANT_READ), which is handled by a loop below.
+
+        assert len(buf) == 2
+        b1, b2 = struct.unpack('BB', buf)
+        finbit = b1 & 0x80 == 0x80
+        assert finbit
+        opcode = b1 & 0x0f
+        assert opcode == 2 # Binary frame
+        maskbit = b2 & 0x80 == 0x80
+        assert maskbit
+        payloadlen = b2 & 0x7f
+
+        if payloadlen < 126:
+            pass
+        elif payloadlen == 126:
+            payloadlen = struct.unpack('>H', self._client.recv(2))[0]
+        else: # payloadlen == 127:
+            payloadlen = struct.unpack('>Q', self._client.recv(2))[0]
+
+        key = self._client.recv(4)
+
+        while self._client.pending() < payloadlen:
+            time.sleep(0.1)
+        masked_payload = self._client.recv(payloadlen)
+
+        payload = b''
+        i = 0
+        for b in masked_payload:
+            payload += bytes([b ^ key[i]])
+            i = (i + 1) % 4
+
+        return payload
 
 # TODO Prototype novel transports, eg periodic http(s) requests for especially restrictive networks
 
@@ -195,6 +270,7 @@ if __name__ == '__main__':
     transport_type.add_argument('--socket', '-s', action='store_const', const='Socket')
     transport_type.add_argument('--tls-socket', '-t', action='store_const', const='TlsSocket')
     transport_type.add_argument('--websocket', '-w', action='store_const', const='WebSocket')
+    transport_type.add_argument('--tls-websocket', '-x', action='store_const', const='TlsWebSocket')
 
     args = parser.parse_args()
 
@@ -214,5 +290,7 @@ if __name__ == '__main__':
                     break
 
                 for r in rlist:
-                    w = target if r == tty else tty
-                    w.write(r.read())
+                    d = r.read()
+                    if d:
+                        w = target if r == tty else tty
+                        w.write(d)

